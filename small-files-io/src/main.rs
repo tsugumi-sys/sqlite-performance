@@ -119,25 +119,42 @@ fn run() -> Result<(), String> {
         }
         "bench" => {
             let config = parse_bench_args(args.collect())?;
-            let summary = bench::run(&config).map_err(|error| error.to_string())?;
+            if config.scenario == "random-write" {
+                let summary =
+                    bench::run_random_write(&config).map_err(|error| error.to_string())?;
 
-            println!("benchmark");
-            println!("  scenario: {}", summary.scenario);
-            println!("  reads: {}", summary.reads);
-            println!("  repeats: {}", summary.repeats);
-            match summary.sqlite_cache_kib {
-                Some(cache_kib) => println!("  sqlite cache: {cache_kib} KiB"),
-                None => println!("  sqlite cache: default"),
-            }
-            println!("  seed: {}", summary.seed);
-            print_bench_target(&summary.fs);
-            print_bench_target(&summary.sqlite);
-            if let Some(repeat_results) = &summary.repeat_results {
-                println!("  per repeat:");
-                for repeat_result in repeat_results {
-                    println!("    repeat {}:", repeat_result.repeat);
-                    print_bench_target_nested(&repeat_result.fs, 6);
-                    print_bench_target_nested(&repeat_result.sqlite, 6);
+                println!("benchmark");
+                println!("  scenario: {}", summary.scenario);
+                println!("  updates: {}", summary.updates);
+                println!("  seed: {}", summary.seed);
+                println!("  work dir: {}", summary.work_dir.display());
+                println!(
+                    "  sqlite commit mode: {}",
+                    summary.sqlite_commit_mode.as_str()
+                );
+                print_write_target(&summary.fs);
+                print_write_target(&summary.sqlite);
+            } else {
+                let summary = bench::run(&config).map_err(|error| error.to_string())?;
+
+                println!("benchmark");
+                println!("  scenario: {}", summary.scenario);
+                println!("  reads: {}", summary.reads);
+                println!("  repeats: {}", summary.repeats);
+                match summary.sqlite_cache_kib {
+                    Some(cache_kib) => println!("  sqlite cache: {cache_kib} KiB"),
+                    None => println!("  sqlite cache: default"),
+                }
+                println!("  seed: {}", summary.seed);
+                print_bench_target(&summary.fs);
+                print_bench_target(&summary.sqlite);
+                if let Some(repeat_results) = &summary.repeat_results {
+                    println!("  per repeat:");
+                    for repeat_result in repeat_results {
+                        println!("    repeat {}:", repeat_result.repeat);
+                        print_bench_target_nested(&repeat_result.fs, 6);
+                        print_bench_target_nested(&repeat_result.sqlite, 6);
+                    }
                 }
             }
 
@@ -438,9 +455,12 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
     let mut fs_store_dir = PathBuf::from("data/fs-store-10000-4096");
     let mut sqlite_database = PathBuf::from("data/sqlite-store-10000-4096/documents.db");
     let mut reads = 1_000usize;
+    let mut updates = 1_000usize;
     let mut repeats = 1usize;
     let mut sqlite_cache_kib = None;
     let mut per_repeat = false;
+    let mut work_dir = PathBuf::from("data/update-bench");
+    let mut sqlite_commit_mode = bench::SqliteCommitMode::Each;
     let mut seed = 1u64;
 
     let mut index = 0;
@@ -458,6 +478,9 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
             "--reads" => {
                 reads = parse_value(&args, &mut index, "--reads")?;
             }
+            "--updates" => {
+                updates = parse_value(&args, &mut index, "--updates")?;
+            }
             "--repeats" => {
                 repeats = parse_value(&args, &mut index, "--repeats")?;
             }
@@ -467,6 +490,13 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
             "--per-repeat" => {
                 per_repeat = true;
                 index += 1;
+            }
+            "--work-dir" => {
+                work_dir = PathBuf::from(parse_string_value(&args, &mut index, "--work-dir")?);
+            }
+            "--sqlite-commit-mode" => {
+                let value = parse_string_value(&args, &mut index, "--sqlite-commit-mode")?;
+                sqlite_commit_mode = bench::SqliteCommitMode::parse(&value)?;
             }
             "--seed" => {
                 seed = parse_value(&args, &mut index, "--seed")?;
@@ -479,11 +509,14 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
         }
     }
 
-    if scenario != "random-read" {
+    if scenario != "random-read" && scenario != "random-write" {
         return Err(format!("unsupported bench scenario for now: {scenario}"));
     }
     if reads == 0 {
         return Err("--reads must be greater than 0".to_string());
+    }
+    if updates == 0 {
+        return Err("--updates must be greater than 0".to_string());
     }
     if repeats == 0 {
         return Err("--repeats must be greater than 0".to_string());
@@ -497,24 +530,32 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
         fs_store_dir,
         sqlite_database,
         reads,
+        updates,
         repeats,
         sqlite_cache_kib,
         per_repeat,
+        work_dir,
+        sqlite_commit_mode,
         seed,
     })
 }
 
 fn print_bench_usage() {
     println!("Bench options:");
-    println!("  --scenario <name>  Benchmark scenario. Default: random-read");
+    println!("  --scenario <name>  random-read or random-write. Default: random-read");
     println!("  --fs <path>        File-system store directory. Default: data/fs-store-10000-4096");
     println!(
         "  --sqlite <path>    SQLite database path. Default: data/sqlite-store-10000-4096/documents.db"
     );
     println!("  --reads <n>        Number of random reads. Default: 1000");
+    println!("  --updates <n>      Number of random writes. Default: 1000");
     println!("  --repeats <n>      Repeat count for the same random read set. Default: 1");
     println!("  --sqlite-cache-kib <n>  SQLite page cache size in KiB. Default: SQLite default");
     println!("  --per-repeat       Print one result block per repeat");
+    println!(
+        "  --work-dir <path>  Disposable work directory for write benchmarks. Default: data/update-bench"
+    );
+    println!("  --sqlite-commit-mode <name>  each or batch for write benchmarks. Default: each");
     println!("  --seed <n>         Deterministic random seed. Default: 1");
 }
 
@@ -544,4 +585,16 @@ fn print_bench_target_nested(result: &bench::BenchTargetResult, indent: usize) {
     println!("{spaces}  p50: {:.6}ms", result.p50_ms);
     println!("{spaces}  p95: {:.6}ms", result.p95_ms);
     println!("{spaces}  p99: {:.6}ms", result.p99_ms);
+}
+
+fn print_write_target(result: &bench::WriteTargetResult) {
+    println!("  {}:", result.target);
+    println!("    elapsed: {:.6}s", result.elapsed_seconds);
+    println!("    operations: {}", result.operations);
+    println!("    operations/sec: {:.2}", result.operations_per_second);
+    println!("    bytes written: {}", result.bytes_written);
+    println!("    MB/sec: {:.2}", result.megabytes_per_second);
+    println!("    size before: {}", result.size_before);
+    println!("    size after: {}", result.size_after);
+    println!("    wal bytes after: {}", result.wal_bytes_after);
 }

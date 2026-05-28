@@ -16,7 +16,31 @@ pub struct BenchConfig {
     pub sqlite_cache_kib: Option<i64>,
     pub per_repeat: bool,
     pub work_dir: PathBuf,
+    pub sqlite_commit_mode: SqliteCommitMode,
     pub seed: u64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum SqliteCommitMode {
+    Each,
+    Batch,
+}
+
+impl SqliteCommitMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "each" => Ok(Self::Each),
+            "batch" => Ok(Self::Batch),
+            _ => Err(format!("unknown sqlite commit mode: {value}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Each => "each",
+            Self::Batch => "batch",
+        }
+    }
 }
 
 pub struct BenchSummary {
@@ -35,6 +59,7 @@ pub struct RandomWriteSummary {
     pub updates: usize,
     pub seed: u64,
     pub work_dir: PathBuf,
+    pub sqlite_commit_mode: SqliteCommitMode,
     pub fs: WriteTargetResult,
     pub sqlite: WriteTargetResult,
 }
@@ -148,7 +173,12 @@ pub fn run_random_write(
     let sqlite_size_before = sqlite_total_size(&sqlite_work_database)?;
 
     let fs = random_write_fs(&fs_work_dir, &paths, fs_size_before)?;
-    let sqlite = random_write_sqlite(&sqlite_work_database, &paths, sqlite_size_before)?;
+    let sqlite = random_write_sqlite(
+        &sqlite_work_database,
+        &paths,
+        sqlite_size_before,
+        config.sqlite_commit_mode,
+    )?;
 
     if fs.bytes_written != sqlite.bytes_written {
         return Err(format!(
@@ -163,6 +193,7 @@ pub fn run_random_write(
         updates: config.updates,
         seed: config.seed,
         work_dir: config.work_dir.clone(),
+        sqlite_commit_mode: config.sqlite_commit_mode,
         fs,
         sqlite,
     })
@@ -202,30 +233,48 @@ fn random_write_sqlite(
     database_path: &Path,
     relative_paths: &[String],
     size_before: u64,
+    commit_mode: SqliteCommitMode,
 ) -> Result<WriteTargetResult, Box<dyn std::error::Error>> {
     let mut conn = Connection::open(database_path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
 
     let started = Instant::now();
-    let transaction = conn.transaction()?;
     let mut bytes_written = 0u64;
-    {
-        let mut statement =
-            transaction.prepare("UPDATE documents SET body = ?, updated_at = ? WHERE path = ?")?;
 
-        for (index, relative_path) in relative_paths.iter().enumerate() {
-            let size: usize = transaction.query_row(
-                "SELECT size_bytes FROM documents WHERE path = ?",
-                [relative_path],
-                |row| row.get::<_, i64>(0),
-            )? as usize;
-            let body = replacement_markdown(index, size);
-            bytes_written += body.len() as u64;
-            statement.execute(params![body, 20260528i64, relative_path])?;
+    match commit_mode {
+        SqliteCommitMode::Batch => {
+            let transaction = conn.transaction()?;
+            {
+                let mut statement = transaction
+                    .prepare("UPDATE documents SET body = ?, updated_at = ? WHERE path = ?")?;
+
+                for (index, relative_path) in relative_paths.iter().enumerate() {
+                    let size = sqlite_document_size(&transaction, relative_path)?;
+                    let body = replacement_markdown(index, size);
+                    bytes_written += body.len() as u64;
+                    statement.execute(params![body, 20260528i64, relative_path])?;
+                }
+            }
+            transaction.commit()?;
+        }
+        SqliteCommitMode::Each => {
+            for (index, relative_path) in relative_paths.iter().enumerate() {
+                let transaction = conn.transaction()?;
+                {
+                    let size = sqlite_document_size(&transaction, relative_path)?;
+                    let body = replacement_markdown(index, size);
+                    bytes_written += body.len() as u64;
+                    transaction.execute(
+                        "UPDATE documents SET body = ?, updated_at = ? WHERE path = ?",
+                        params![body, 20260528i64, relative_path],
+                    )?;
+                }
+                transaction.commit()?;
+            }
         }
     }
-    transaction.commit()?;
+
     let elapsed = started.elapsed();
     drop(conn);
 
@@ -241,6 +290,15 @@ fn random_write_sqlite(
         size_after,
         wal_bytes_after,
     ))
+}
+
+fn sqlite_document_size(conn: &Connection, relative_path: &str) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT size_bytes FROM documents WHERE path = ?",
+        [relative_path],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|size| size as usize)
 }
 
 fn replacement_markdown(index: usize, target_size: usize) -> String {
@@ -609,7 +667,9 @@ fn tree_size(path: &Path) -> io::Result<u64> {
 }
 
 fn sqlite_total_size(database_path: &Path) -> io::Result<u64> {
-    Ok(file_size(database_path)? + file_size(&wal_path(database_path))? + file_size(&shm_path(database_path))?)
+    Ok(file_size(database_path)?
+        + file_size(&wal_path(database_path))?
+        + file_size(&shm_path(database_path))?)
 }
 
 fn file_size(path: &Path) -> io::Result<u64> {
