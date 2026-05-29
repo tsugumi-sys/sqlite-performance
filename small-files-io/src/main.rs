@@ -75,6 +75,7 @@ fn run() -> Result<(), String> {
             println!("  wal bytes: {}", summary.wal_bytes);
             println!("  shm bytes: {}", summary.shm_bytes);
             println!("  total sqlite bytes: {}", summary.total_bytes);
+            println!("  fts enabled: {}", summary.fts_enabled);
             println!("  journal mode: {}", config.journal_mode);
             println!("  synchronous: {}", config.synchronous);
             println!("  batch size: {}", config.batch_size);
@@ -134,6 +135,15 @@ fn run() -> Result<(), String> {
                 );
                 print_write_target(&summary.fs);
                 print_write_target(&summary.sqlite);
+            } else if config.scenario == "body-search" {
+                let summary = bench::run_body_search(&config).map_err(|error| error.to_string())?;
+
+                println!("benchmark");
+                println!("  scenario: {}", summary.scenario);
+                println!("  keyword: {}", summary.keyword);
+                print_search_target(&summary.fs_rg);
+                print_search_target(&summary.sqlite_like);
+                print_search_target(&summary.sqlite_fts);
             } else {
                 let summary = bench::run(&config).map_err(|error| error.to_string())?;
 
@@ -329,6 +339,7 @@ fn parse_load_sqlite_args(args: Vec<String>) -> Result<SqliteLoadConfig, String>
     let mut journal_mode = "WAL".to_string();
     let mut synchronous = "NORMAL".to_string();
     let mut batch_size = 1_000usize;
+    let mut enable_fts = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -351,6 +362,10 @@ fn parse_load_sqlite_args(args: Vec<String>) -> Result<SqliteLoadConfig, String>
             }
             "--batch-size" => {
                 batch_size = parse_value(&args, &mut index, "--batch-size")?;
+            }
+            "--fts" => {
+                enable_fts = true;
+                index += 1;
             }
             "--overwrite" => {
                 overwrite = true;
@@ -379,6 +394,7 @@ fn parse_load_sqlite_args(args: Vec<String>) -> Result<SqliteLoadConfig, String>
         journal_mode,
         synchronous,
         batch_size,
+        enable_fts,
     })
 }
 
@@ -398,6 +414,7 @@ fn print_load_sqlite_usage() {
     println!("  --journal-mode <name>  SQLite journal mode. Default: WAL");
     println!("  --synchronous <name>   SQLite synchronous mode. Default: NORMAL");
     println!("  --batch-size <n>       Rows per transaction. Default: 1000");
+    println!("  --fts                  Build an FTS5 table for body search");
     println!("  --overwrite            Remove an existing database first");
 }
 
@@ -461,6 +478,7 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
     let mut per_repeat = false;
     let mut work_dir = PathBuf::from("data/update-bench");
     let mut sqlite_commit_mode = bench::SqliteCommitMode::Each;
+    let mut keyword = "latency".to_string();
     let mut seed = 1u64;
 
     let mut index = 0;
@@ -498,6 +516,9 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
                 let value = parse_string_value(&args, &mut index, "--sqlite-commit-mode")?;
                 sqlite_commit_mode = bench::SqliteCommitMode::parse(&value)?;
             }
+            "--keyword" => {
+                keyword = parse_string_value(&args, &mut index, "--keyword")?;
+            }
             "--seed" => {
                 seed = parse_value(&args, &mut index, "--seed")?;
             }
@@ -509,7 +530,7 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
         }
     }
 
-    if scenario != "random-read" && scenario != "random-write" {
+    if scenario != "random-read" && scenario != "random-write" && scenario != "body-search" {
         return Err(format!("unsupported bench scenario for now: {scenario}"));
     }
     if reads == 0 {
@@ -536,13 +557,16 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
         per_repeat,
         work_dir,
         sqlite_commit_mode,
+        keyword,
         seed,
     })
 }
 
 fn print_bench_usage() {
     println!("Bench options:");
-    println!("  --scenario <name>  random-read or random-write. Default: random-read");
+    println!(
+        "  --scenario <name>  random-read, random-write, or body-search. Default: random-read"
+    );
     println!("  --fs <path>        File-system store directory. Default: data/fs-store-10000-4096");
     println!(
         "  --sqlite <path>    SQLite database path. Default: data/sqlite-store-10000-4096/documents.db"
@@ -556,6 +580,7 @@ fn print_bench_usage() {
         "  --work-dir <path>  Disposable work directory for write benchmarks. Default: data/update-bench"
     );
     println!("  --sqlite-commit-mode <name>  each or batch for write benchmarks. Default: each");
+    println!("  --keyword <text>   Keyword for body-search. Default: latency");
     println!("  --seed <n>         Deterministic random seed. Default: 1");
 }
 
@@ -597,4 +622,10 @@ fn print_write_target(result: &bench::WriteTargetResult) {
     println!("    size before: {}", result.size_before);
     println!("    size after: {}", result.size_after);
     println!("    wal bytes after: {}", result.wal_bytes_after);
+}
+
+fn print_search_target(result: &bench::SearchTargetResult) {
+    println!("  {}:", result.target);
+    println!("    elapsed: {:.6}s", result.elapsed_seconds);
+    println!("    matches: {}", result.matches);
 }

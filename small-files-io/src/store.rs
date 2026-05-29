@@ -17,6 +17,7 @@ pub struct SqliteLoadConfig {
     pub journal_mode: String,
     pub synchronous: String,
     pub batch_size: usize,
+    pub enable_fts: bool,
 }
 
 pub struct FsLoadSummary {
@@ -33,6 +34,7 @@ pub struct SqliteLoadSummary {
     pub wal_bytes: u64,
     pub shm_bytes: u64,
     pub total_bytes: u64,
+    pub fts_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -100,7 +102,7 @@ pub fn load_sqlite(
     let mut conn = Connection::open(&config.database_path)?;
 
     apply_pragmas(&conn, config)?;
-    create_schema(&conn)?;
+    create_schema(&conn, config.enable_fts)?;
 
     let mut files = 0usize;
     let mut bytes = 0u64;
@@ -113,19 +115,30 @@ pub fn load_sqlite(
                  (path, title, tags, body, size_bytes, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
+            let mut fts_statement =
+                if config.enable_fts {
+                    Some(transaction.prepare(
+                        "INSERT INTO documents_fts (path, title, body) VALUES (?1, ?2, ?3)",
+                    )?)
+                } else {
+                    None
+                };
 
             for document in chunk {
                 let parsed = parse_document(&files_dir, document)?;
                 bytes += parsed.size_bytes as u64;
                 statement.execute(params![
-                    parsed.path,
-                    parsed.title,
-                    parsed.tags,
-                    parsed.body,
+                    &parsed.path,
+                    &parsed.title,
+                    &parsed.tags,
+                    &parsed.body,
                     parsed.size_bytes,
                     parsed.created_at,
                     parsed.updated_at,
                 ])?;
+                if let Some(fts_statement) = &mut fts_statement {
+                    fts_statement.execute(params![&parsed.path, &parsed.title, &parsed.body])?;
+                }
                 files += 1;
             }
         }
@@ -146,6 +159,7 @@ pub fn load_sqlite(
         wal_bytes,
         shm_bytes,
         total_bytes: database_bytes + wal_bytes + shm_bytes,
+        fts_enabled: config.enable_fts,
     })
 }
 
@@ -242,7 +256,7 @@ fn apply_pragmas(conn: &Connection, config: &SqliteLoadConfig) -> rusqlite::Resu
     Ok(())
 }
 
-fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
+fn create_schema(conn: &Connection, enable_fts: bool) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE documents (
             id INTEGER PRIMARY KEY,
@@ -257,7 +271,19 @@ fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE INDEX idx_documents_updated_at ON documents(updated_at);
         CREATE INDEX idx_documents_title ON documents(title);",
-    )
+    )?;
+
+    if enable_fts {
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE documents_fts USING fts5(
+                path UNINDEXED,
+                title,
+                body
+            );",
+        )?;
+    }
+
+    Ok(())
 }
 
 fn parse_document(root: &Path, document: &SourceDocument) -> io::Result<ParsedDocument> {

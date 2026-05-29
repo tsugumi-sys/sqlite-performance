@@ -2,6 +2,7 @@ use std::fs;
 use std::hint::black_box;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, params};
@@ -17,6 +18,7 @@ pub struct BenchConfig {
     pub per_repeat: bool,
     pub work_dir: PathBuf,
     pub sqlite_commit_mode: SqliteCommitMode,
+    pub keyword: String,
     pub seed: u64,
 }
 
@@ -74,6 +76,20 @@ pub struct WriteTargetResult {
     pub size_before: u64,
     pub size_after: u64,
     pub wal_bytes_after: u64,
+}
+
+pub struct BodySearchSummary {
+    pub scenario: String,
+    pub keyword: String,
+    pub fs_rg: SearchTargetResult,
+    pub sqlite_like: SearchTargetResult,
+    pub sqlite_fts: SearchTargetResult,
+}
+
+pub struct SearchTargetResult {
+    pub target: &'static str,
+    pub elapsed_seconds: f64,
+    pub matches: usize,
 }
 
 pub struct BenchTargetResult {
@@ -196,6 +212,94 @@ pub fn run_random_write(
         sqlite_commit_mode: config.sqlite_commit_mode,
         fs,
         sqlite,
+    })
+}
+
+pub fn run_body_search(
+    config: &BenchConfig,
+) -> Result<BodySearchSummary, Box<dyn std::error::Error>> {
+    Ok(BodySearchSummary {
+        scenario: config.scenario.clone(),
+        keyword: config.keyword.clone(),
+        fs_rg: body_search_rg(&config.fs_store_dir, &config.keyword)?,
+        sqlite_like: body_search_sqlite_like(&config.sqlite_database, &config.keyword)?,
+        sqlite_fts: body_search_sqlite_fts(&config.sqlite_database, &config.keyword)?,
+    })
+}
+
+fn body_search_rg(
+    fs_store_dir: &Path,
+    keyword: &str,
+) -> Result<SearchTargetResult, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let output = Command::new("rg")
+        .arg("-l")
+        .arg("--fixed-strings")
+        .arg(keyword)
+        .arg(fs_store_dir)
+        .output()?;
+    let elapsed = started.elapsed();
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(format!(
+            "rg failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+
+    let matches = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .count();
+
+    Ok(SearchTargetResult {
+        target: "fs-rg",
+        elapsed_seconds: elapsed.as_secs_f64(),
+        matches,
+    })
+}
+
+fn body_search_sqlite_like(
+    database_path: &Path,
+    keyword: &str,
+) -> Result<SearchTargetResult, Box<dyn std::error::Error>> {
+    let conn =
+        Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let pattern = format!("%{keyword}%");
+    let started = Instant::now();
+    let matches = conn.query_row(
+        "SELECT count(*) FROM documents WHERE body LIKE ?",
+        [pattern],
+        |row| row.get::<_, i64>(0),
+    )? as usize;
+    let elapsed = started.elapsed();
+
+    Ok(SearchTargetResult {
+        target: "sqlite-like",
+        elapsed_seconds: elapsed.as_secs_f64(),
+        matches,
+    })
+}
+
+fn body_search_sqlite_fts(
+    database_path: &Path,
+    keyword: &str,
+) -> Result<SearchTargetResult, Box<dyn std::error::Error>> {
+    let conn =
+        Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let started = Instant::now();
+    let matches = conn.query_row(
+        "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?",
+        [keyword],
+        |row| row.get::<_, i64>(0),
+    )? as usize;
+    let elapsed = started.elapsed();
+
+    Ok(SearchTargetResult {
+        target: "sqlite-fts",
+        elapsed_seconds: elapsed.as_secs_f64(),
+        matches,
     })
 }
 
