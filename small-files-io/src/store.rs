@@ -20,6 +20,13 @@ pub struct SqliteLoadConfig {
     pub enable_fts: bool,
 }
 
+pub struct TursoLoadConfig {
+    pub dataset_dir: PathBuf,
+    pub database_path: PathBuf,
+    pub overwrite: bool,
+    pub batch_size: usize,
+}
+
 pub struct FsLoadSummary {
     pub output_dir: PathBuf,
     pub files: usize,
@@ -35,6 +42,13 @@ pub struct SqliteLoadSummary {
     pub shm_bytes: u64,
     pub total_bytes: u64,
     pub fts_enabled: bool,
+}
+
+pub struct TursoLoadSummary {
+    pub database_path: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    pub database_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -115,14 +129,14 @@ pub fn load_sqlite(
                  (path, title, tags, body, size_bytes, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            let mut fts_statement =
-                if config.enable_fts {
-                    Some(transaction.prepare(
-                        "INSERT INTO documents_fts (path, title, body) VALUES (?1, ?2, ?3)",
-                    )?)
-                } else {
-                    None
-                };
+            let mut fts_statement = if config.enable_fts {
+                Some(
+                    transaction
+                        .prepare("INSERT INTO documents_fts (path, body) VALUES (?1, ?2)")?,
+                )
+            } else {
+                None
+            };
 
             for document in chunk {
                 let parsed = parse_document(&files_dir, document)?;
@@ -137,7 +151,7 @@ pub fn load_sqlite(
                     parsed.updated_at,
                 ])?;
                 if let Some(fts_statement) = &mut fts_statement {
-                    fts_statement.execute(params![&parsed.path, &parsed.title, &parsed.body])?;
+                    fts_statement.execute(params![&parsed.path, &parsed.body])?;
                 }
                 files += 1;
             }
@@ -160,6 +174,87 @@ pub fn load_sqlite(
         shm_bytes,
         total_bytes: database_bytes + wal_bytes + shm_bytes,
         fts_enabled: config.enable_fts,
+    })
+}
+
+pub fn load_turso(
+    config: &TursoLoadConfig,
+) -> Result<TursoLoadSummary, Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(load_turso_async(config))
+}
+
+async fn load_turso_async(
+    config: &TursoLoadConfig,
+) -> Result<TursoLoadSummary, Box<dyn std::error::Error>> {
+    if let Some(parent) = config.database_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if config.database_path.exists() {
+        if config.overwrite {
+            fs::remove_file(&config.database_path)?;
+        } else {
+            return Err(format!(
+                "{} already exists; pass --overwrite to replace it",
+                config.database_path.display()
+            )
+            .into());
+        }
+    }
+
+    let files_dir = dataset_files_dir(&config.dataset_dir);
+    let documents = collect_markdown_files(&files_dir)?;
+    let database_path = config.database_path.to_string_lossy().to_string();
+    let db = turso::Builder::new_local(&database_path)
+        .experimental_index_method(true)
+        .build()
+        .await?;
+    let mut conn = db.connect()?;
+
+    create_turso_schema(&conn).await?;
+
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+
+    for chunk in documents.chunks(config.batch_size) {
+        let transaction = conn.transaction().await?;
+        for document in chunk {
+            let parsed = parse_document(&files_dir, document)?;
+            bytes += parsed.size_bytes as u64;
+            transaction
+                .execute(
+                    "INSERT INTO documents \
+                     (path, title, tags, body, size_bytes, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    turso::params![
+                        parsed.path.clone(),
+                        parsed.title.clone(),
+                        parsed.tags.clone(),
+                        parsed.body.clone(),
+                        parsed.size_bytes,
+                        parsed.created_at,
+                        parsed.updated_at
+                    ],
+                )
+                .await?;
+            files += 1;
+        }
+        transaction.commit().await?;
+    }
+
+    conn.execute("OPTIMIZE INDEX idx_documents_fts", ()).await?;
+
+    drop(conn);
+    drop(db);
+
+    Ok(TursoLoadSummary {
+        database_path: config.database_path.clone(),
+        files,
+        bytes,
+        database_bytes: file_size(&config.database_path)?,
     })
 }
 
@@ -277,11 +372,33 @@ fn create_schema(conn: &Connection, enable_fts: bool) -> rusqlite::Result<()> {
         conn.execute_batch(
             "CREATE VIRTUAL TABLE documents_fts USING fts5(
                 path UNINDEXED,
-                title,
                 body
             );",
         )?;
     }
+
+    Ok(())
+}
+
+async fn create_turso_schema(conn: &turso::Connection) -> turso::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE documents (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            body TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX idx_documents_updated_at ON documents(updated_at);
+        CREATE INDEX idx_documents_title ON documents(title);
+
+        CREATE INDEX idx_documents_fts ON documents USING fts (body);",
+    )
+    .await?;
 
     Ok(())
 }

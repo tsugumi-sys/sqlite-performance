@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
+turso = "0.6.1"
+turso_core = { version = "0.6.1", features = ["fts"] }
+tokio = { version = "1", features = ["rt"] }

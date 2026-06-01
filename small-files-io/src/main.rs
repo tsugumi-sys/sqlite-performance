@@ -11,7 +11,7 @@ use std::time::Instant;
 use bench::BenchConfig;
 use dataset::{GenerateConfig, Layout};
 use diagnosis::DiagnosisConfig;
-use store::{FsLoadConfig, SqliteLoadConfig};
+use store::{FsLoadConfig, SqliteLoadConfig, TursoLoadConfig};
 
 fn main() {
     if let Err(error) = run() {
@@ -83,6 +83,23 @@ fn run() -> Result<(), String> {
 
             Ok(())
         }
+        "load-turso" => {
+            let config = parse_load_turso_args(args.collect())?;
+            let started = Instant::now();
+            let summary = store::load_turso(&config).map_err(|error| error.to_string())?;
+            let elapsed = started.elapsed();
+
+            println!("loaded turso store");
+            println!("  database: {}", summary.database_path.display());
+            println!("  files: {}", summary.files);
+            println!("  bytes: {}", summary.bytes);
+            println!("  database bytes: {}", summary.database_bytes);
+            println!("  fts enabled: true");
+            println!("  batch size: {}", config.batch_size);
+            println!("  elapsed: {:.3}s", elapsed.as_secs_f64());
+
+            Ok(())
+        }
         "diagnose" | "diagnosis" => {
             let config = parse_diagnosis_args(args.collect())?;
             let summary = diagnosis::diagnose(&config).map_err(|error| error.to_string())?;
@@ -144,6 +161,9 @@ fn run() -> Result<(), String> {
                 print_search_target(&summary.fs_rg);
                 print_search_target(&summary.sqlite_like);
                 print_search_target(&summary.sqlite_fts);
+                if let Some(turso_fts) = &summary.turso_fts {
+                    print_search_target(turso_fts);
+                }
             } else {
                 let summary = bench::run(&config).map_err(|error| error.to_string())?;
 
@@ -266,6 +286,7 @@ fn print_usage() {
     println!("  small-files-io generate [options]");
     println!("  small-files-io load-fs [options]");
     println!("  small-files-io load-sqlite [options]");
+    println!("  small-files-io load-turso [options]");
     println!("  small-files-io diagnose [options]");
     println!("  small-files-io bench [options]");
     println!("  small-files-io help");
@@ -275,6 +296,8 @@ fn print_usage() {
     print_load_fs_usage();
     println!();
     print_load_sqlite_usage();
+    println!();
+    print_load_turso_usage();
     println!();
     print_diagnosis_usage();
     println!();
@@ -418,6 +441,66 @@ fn print_load_sqlite_usage() {
     println!("  --overwrite            Remove an existing database first");
 }
 
+fn parse_load_turso_args(args: Vec<String>) -> Result<TursoLoadConfig, String> {
+    let mut dataset_dir: Option<PathBuf> = None;
+    let mut database_path = PathBuf::from("data/turso-store-10000-4096/documents.db");
+    let mut overwrite = false;
+    let mut batch_size = 1_000usize;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dataset" => {
+                dataset_dir = Some(PathBuf::from(parse_string_value(
+                    &args,
+                    &mut index,
+                    "--dataset",
+                )?));
+            }
+            "--database" => {
+                database_path = PathBuf::from(parse_string_value(&args, &mut index, "--database")?);
+            }
+            "--batch-size" => {
+                batch_size = parse_value(&args, &mut index, "--batch-size")?;
+            }
+            "--overwrite" => {
+                overwrite = true;
+                index += 1;
+            }
+            "--help" | "-h" => {
+                print_load_turso_usage();
+                process::exit(0);
+            }
+            other => return Err(format!("unknown load-turso option: {other}")),
+        }
+    }
+
+    if batch_size == 0 {
+        return Err("--batch-size must be greater than 0".to_string());
+    }
+
+    let Some(dataset_dir) = dataset_dir else {
+        return Err("missing required option: --dataset <path>".to_string());
+    };
+
+    Ok(TursoLoadConfig {
+        dataset_dir,
+        database_path,
+        overwrite,
+        batch_size,
+    })
+}
+
+fn print_load_turso_usage() {
+    println!("Load local Turso store options:");
+    println!("  --dataset <path>       Generated dataset directory. Required");
+    println!(
+        "  --database <path>      Turso database path. Default: data/turso-store-10000-4096/documents.db"
+    );
+    println!("  --batch-size <n>       Rows per transaction. Default: 1000");
+    println!("  --overwrite            Remove an existing database first");
+}
+
 fn parse_diagnosis_args(args: Vec<String>) -> Result<DiagnosisConfig, String> {
     let mut dataset_dir = PathBuf::from("data/generated-10000-4096");
     let mut fs_store_dir = PathBuf::from("data/fs-store-10000-4096");
@@ -479,6 +562,7 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
     let mut work_dir = PathBuf::from("data/update-bench");
     let mut sqlite_commit_mode = bench::SqliteCommitMode::Each;
     let mut keyword = "latency".to_string();
+    let mut turso_database: Option<PathBuf> = None;
     let mut seed = 1u64;
 
     let mut index = 0;
@@ -519,6 +603,11 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
             "--keyword" => {
                 keyword = parse_string_value(&args, &mut index, "--keyword")?;
             }
+            "--turso" => {
+                turso_database = Some(PathBuf::from(parse_string_value(
+                    &args, &mut index, "--turso",
+                )?));
+            }
             "--seed" => {
                 seed = parse_value(&args, &mut index, "--seed")?;
             }
@@ -558,6 +647,7 @@ fn parse_bench_args(args: Vec<String>) -> Result<BenchConfig, String> {
         work_dir,
         sqlite_commit_mode,
         keyword,
+        turso_database,
         seed,
     })
 }
@@ -581,6 +671,7 @@ fn print_bench_usage() {
     );
     println!("  --sqlite-commit-mode <name>  each or batch for write benchmarks. Default: each");
     println!("  --keyword <text>   Keyword for body-search. Default: latency");
+    println!("  --turso <path>     Include local Turso FTS database in body-search");
     println!("  --seed <n>         Deterministic random seed. Default: 1");
 }
 

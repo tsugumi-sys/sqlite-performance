@@ -19,6 +19,7 @@ pub struct BenchConfig {
     pub work_dir: PathBuf,
     pub sqlite_commit_mode: SqliteCommitMode,
     pub keyword: String,
+    pub turso_database: Option<PathBuf>,
     pub seed: u64,
 }
 
@@ -84,6 +85,7 @@ pub struct BodySearchSummary {
     pub fs_rg: SearchTargetResult,
     pub sqlite_like: SearchTargetResult,
     pub sqlite_fts: SearchTargetResult,
+    pub turso_fts: Option<SearchTargetResult>,
 }
 
 pub struct SearchTargetResult {
@@ -224,6 +226,11 @@ pub fn run_body_search(
         fs_rg: body_search_rg(&config.fs_store_dir, &config.keyword)?,
         sqlite_like: body_search_sqlite_like(&config.sqlite_database, &config.keyword)?,
         sqlite_fts: body_search_sqlite_fts(&config.sqlite_database, &config.keyword)?,
+        turso_fts: config
+            .turso_database
+            .as_deref()
+            .map(|database_path| body_search_turso_fts(database_path, &config.keyword))
+            .transpose()?,
     })
 }
 
@@ -290,7 +297,7 @@ fn body_search_sqlite_fts(
         Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let started = Instant::now();
     let matches = conn.query_row(
-        "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?",
+        "SELECT count(*) FROM documents_fts WHERE body MATCH ?",
         [keyword],
         |row| row.get::<_, i64>(0),
     )? as usize;
@@ -298,6 +305,50 @@ fn body_search_sqlite_fts(
 
     Ok(SearchTargetResult {
         target: "sqlite-fts",
+        elapsed_seconds: elapsed.as_secs_f64(),
+        matches,
+    })
+}
+
+fn body_search_turso_fts(
+    database_path: &Path,
+    keyword: &str,
+) -> Result<SearchTargetResult, Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(body_search_turso_fts_async(database_path, keyword))
+}
+
+async fn body_search_turso_fts_async(
+    database_path: &Path,
+    keyword: &str,
+) -> Result<SearchTargetResult, Box<dyn std::error::Error>> {
+    let database_path = database_path.to_string_lossy().to_string();
+    let db = turso::Builder::new_local(&database_path)
+        .experimental_index_method(true)
+        .build()
+        .await?;
+    let conn = db.connect()?;
+    let started = Instant::now();
+    let mut rows = conn
+        .query(
+            "SELECT count(*) FROM documents WHERE body MATCH ?",
+            [keyword],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or("turso-fts count query returned no rows")?;
+    let matches = match row.get_value(0)? {
+        turso::Value::Integer(value) => value as usize,
+        value => return Err(format!("unexpected turso-fts count value: {value:?}").into()),
+    };
+    let elapsed = started.elapsed();
+
+    Ok(SearchTargetResult {
+        target: "turso-fts",
         elapsed_seconds: elapsed.as_secs_f64(),
         matches,
     })
